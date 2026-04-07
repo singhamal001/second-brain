@@ -1,0 +1,36 @@
+# VCS and local metadata
+.git
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local env/runtime artifacts
+.env
+.env.*
+*.db
+*.sqlite
+
+# Local vault and temporary outputs
+vault/
+
+# Virtual envs
+.venv/
+venv/
+
+# IDE files
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
