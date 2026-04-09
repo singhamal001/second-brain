@@ -66,7 +66,9 @@ def create_mcp_server(
     reporting_service: ReportingService,
     audit_service: AuditService,
 ) -> FastMCP:
-    mcp = FastMCP(name=name)
+    # Bind FastMCP to 0.0.0.0 so the SDK does not auto-enable localhost-only
+    # Host header protection, which breaks reverse-proxy/tunnel hostnames.
+    mcp = FastMCP(name=name, host="0.0.0.0")
     mcp.version = version
 
     def current_client_code() -> str | None:

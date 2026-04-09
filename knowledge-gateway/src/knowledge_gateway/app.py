@@ -55,12 +55,14 @@ def create_app() -> FastAPI:
         reporting_service=reporting_service,
         audit_service=audit_service,
     )
+    mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        logger.info("knowledge gateway started")
-        yield
-        logger.info("knowledge gateway stopped")
+        async with mcp_app.router.lifespan_context(mcp_app):
+            logger.info("knowledge gateway started")
+            yield
+            logger.info("knowledge gateway stopped")
 
     app = FastAPI(title="knowledge-gateway", version=settings.mcp_server_version, lifespan=lifespan)
 
@@ -68,6 +70,7 @@ def create_app() -> FastAPI:
     app.state.db_store = db_store
     app.state.auth_service = auth_service
     app.state.mcp = mcp
+    app.state.mcp_app = mcp_app
 
     @app.middleware("http")
     async def mcp_auth_middleware(request: Request, call_next):
@@ -104,5 +107,7 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    app.mount("/mcp", mcp.streamable_http_app())
+    # FastMCP's streamable HTTP app already exposes its endpoint at /mcp.
+    # Mounting it at /mcp would produce an effective path of /mcp/mcp.
+    app.mount("/", mcp_app)
     return app
