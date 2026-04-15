@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -10,10 +12,16 @@ from pydantic import BaseModel, Field
 from .context import current_auth_context
 from .services.audit import AuditService
 from .services.db_store import DBStore
-from .services.errors import GatewayError
+from .services.errors import GatewayError, ValidationError
 from .services.obsidian_store import ObsidianStore
 from .services.reporting import ReportingService
 from .services.schema_manager import SchemaManager
+from .skills_catalog import (
+    DEFAULT_LOGGING_SKILL_CONTENT,
+    LOGGING_SKILL_CANONICAL_PATH,
+    LOGGING_SKILL_NAME,
+    LOGGING_SKILL_VERSION,
+)
 
 
 class ColumnSpec(BaseModel):
@@ -54,6 +62,95 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{6,128}$")
+_SOURCE_RE = re.compile(r"^[a-z0-9._-]{2,40}$")
+
+
+def _clean_required_text(value: str, label: str, *, max_len: int = 200) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{label} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValidationError(f"{label} cannot be empty")
+    if len(cleaned) > max_len:
+        raise ValidationError(f"{label} exceeds max length {max_len}")
+    return cleaned
+
+
+def _clean_optional_text(value: str | None, label: str, *, max_len: int = 8000) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"{label} must be a string or null")
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > max_len:
+        raise ValidationError(f"{label} exceeds max length {max_len}")
+    return cleaned
+
+
+def _clean_idempotency_key(value: str) -> str:
+    key = _clean_required_text(value, "idempotency_key", max_len=128)
+    if not _IDEMPOTENCY_KEY_RE.match(key):
+        raise ValidationError(
+            "idempotency_key must match ^[A-Za-z0-9._:-]{6,128}$ (example: codex-machineA-20260411-001)"
+        )
+    return key
+
+
+def _clean_source(value: str) -> str:
+    source = _clean_required_text(value, "source", max_len=40).lower()
+    if not _SOURCE_RE.match(source):
+        raise ValidationError("source must match ^[a-z0-9._-]{2,40}$")
+    return source
+
+
+def _clean_tags(tags: list[str] | None) -> list[str] | None:
+    if tags is None:
+        return None
+    if not isinstance(tags, list):
+        raise ValidationError("tags must be an array of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(tags):
+        if not isinstance(item, str):
+            raise ValidationError(f"tags[{idx}] must be a string")
+        tag = item.strip().lower()
+        if not tag:
+            continue
+        if len(tag) > 48:
+            raise ValidationError("each tag must be <= 48 chars")
+        if tag not in seen:
+            normalized.append(tag)
+            seen.add(tag)
+    if len(normalized) > 20:
+        raise ValidationError("tags cannot exceed 20 items")
+    return normalized or None
+
+
+def _clean_skill_content(value: str, *, max_len: int = 200_000) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("content must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValidationError("content cannot be empty")
+    if len(cleaned) > max_len:
+        raise ValidationError(f"content exceeds max length {max_len}")
+    return cleaned + "\n"
+
+
+def _skill_snapshot(content: str, source: str) -> dict[str, Any]:
+    return {
+        "skill_name": LOGGING_SKILL_NAME,
+        "version": LOGGING_SKILL_VERSION,
+        "path": LOGGING_SKILL_CANONICAL_PATH,
+        "source": source,
+        "checksum_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "content": content,
+    }
 
 
 def create_mcp_server(
@@ -193,8 +290,15 @@ def create_mcp_server(
             f"## Impact\n{row.get('impact') or ''}\n"
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Create a top-level employer/client record. Use this before creating projects if the employer "
+            "does not already exist."
+        )
+    )
     def create_employer(name: str, description: str | None = None) -> dict[str, Any]:
+        name = _clean_required_text(name, "name", max_len=160)
+        description = _clean_optional_text(description, "description", max_len=1200)
         payload = {"name": name, "description": description}
 
         def _exec() -> tuple[dict[str, Any], int, None, str]:
@@ -209,7 +313,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Create a project under an existing employer and initialize canonical Obsidian folder structure: "
+            "Employers/<Employer>/<Project>/."
+        )
+    )
     def create_project(
         employer_name: str,
         project_name: str,
@@ -217,6 +326,11 @@ def create_mcp_server(
         description: str | None = None,
         status: str = "active",
     ) -> dict[str, Any]:
+        employer_name = _clean_required_text(employer_name, "employer_name", max_len=160)
+        project_name = _clean_required_text(project_name, "project_name", max_len=180)
+        code_name = _clean_optional_text(code_name, "code_name", max_len=120)
+        description = _clean_optional_text(description, "description", max_len=2000)
+        status = _clean_required_text(status, "status", max_len=40).lower()
         payload = {
             "employer_name": employer_name,
             "project_name": project_name,
@@ -244,7 +358,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Log a coding session in structured form and dual-write to Obsidian markdown. Prefer this for "
+            "session updates instead of free-form note writes. Reuse idempotency_key for retries."
+        )
+    )
     def log_coding_session(
         employer_name: str,
         project_name: str,
@@ -266,6 +385,31 @@ def create_mcp_server(
         tags: list[str] | None = None,
         source: str = "codex",
     ) -> dict[str, Any]:
+        employer_name = _clean_required_text(employer_name, "employer_name", max_len=160)
+        project_name = _clean_required_text(project_name, "project_name", max_len=180)
+        session_title = _clean_required_text(session_title, "session_title", max_len=220)
+        idempotency_key = _clean_idempotency_key(idempotency_key)
+        source = _clean_source(source)
+        objective = _clean_optional_text(objective, "objective")
+        summary = _clean_optional_text(summary, "summary")
+        thought_process = _clean_optional_text(thought_process, "thought_process")
+        methodology = _clean_optional_text(methodology, "methodology")
+        major_changes = _clean_optional_text(major_changes, "major_changes")
+        advantages = _clean_optional_text(advantages, "advantages")
+        disadvantages = _clean_optional_text(disadvantages, "disadvantages")
+        blockers = _clean_optional_text(blockers, "blockers")
+        next_steps = _clean_optional_text(next_steps, "next_steps")
+        learnings = _clean_optional_text(learnings, "learnings")
+        skills_updates = _clean_optional_text(skills_updates, "skills_updates")
+        tags = _clean_tags(tags)
+
+        parsed_started_at = _parse_datetime(started_at)
+        parsed_ended_at = _parse_datetime(ended_at)
+        if parsed_started_at is None:
+            raise ValidationError("started_at is required and must be ISO-8601")
+        if parsed_ended_at and parsed_ended_at < parsed_started_at:
+            raise ValidationError("ended_at cannot be earlier than started_at")
+
         payload = {
             "employer_name": employer_name,
             "project_name": project_name,
@@ -292,8 +436,8 @@ def create_mcp_server(
             row = db_store.log_session(
                 {
                     **payload,
-                    "started_at": _parse_datetime(started_at),
-                    "ended_at": _parse_datetime(ended_at),
+                    "started_at": parsed_started_at,
+                    "ended_at": parsed_ended_at,
                 }
             )
             note_path = row.get("obsidian_note_path")
@@ -318,7 +462,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Log a meeting as structured data and generate/update canonical Obsidian meeting note under the "
+            "project update folder."
+        )
+    )
     def log_meeting(
         employer_name: str,
         project_name: str,
@@ -331,6 +480,10 @@ def create_mcp_server(
         commitments: list[str] | None = None,
         next_steps: list[str] | None = None,
     ) -> dict[str, Any]:
+        employer_name = _clean_required_text(employer_name, "employer_name", max_len=160)
+        project_name = _clean_required_text(project_name, "project_name", max_len=180)
+        meeting_title = _clean_required_text(meeting_title, "meeting_title", max_len=220)
+        summary = _clean_optional_text(summary, "summary")
         payload = {
             "employer_name": employer_name,
             "project_name": project_name,
@@ -366,7 +519,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Log an architectural or product decision with rationale/pros/cons and generate a canonical "
+            "decision note in Obsidian."
+        )
+    )
     def log_decision(
         employer_name: str,
         project_name: str,
@@ -380,6 +538,16 @@ def create_mcp_server(
         impact: str | None = None,
         status: str = "active",
     ) -> dict[str, Any]:
+        employer_name = _clean_required_text(employer_name, "employer_name", max_len=160)
+        project_name = _clean_required_text(project_name, "project_name", max_len=180)
+        title = _clean_required_text(title, "title", max_len=220)
+        context = _clean_optional_text(context, "context")
+        chosen_option = _clean_optional_text(chosen_option, "chosen_option", max_len=1000)
+        rationale = _clean_optional_text(rationale, "rationale")
+        pros = _clean_optional_text(pros, "pros")
+        cons = _clean_optional_text(cons, "cons")
+        impact = _clean_optional_text(impact, "impact")
+        status = _clean_required_text(status, "status", max_len=40).lower()
         payload = {
             "employer_name": employer_name,
             "project_name": project_name,
@@ -416,7 +584,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Create a new dynamic table with standard non-destructive columns: id, created_at, updated_at, archived. "
+            "Use this instead of raw SQL DDL."
+        )
+    )
     def create_dynamic_table(table_name: str, description: str, columns: list[ColumnSpec]) -> dict[str, Any]:
         payload = {
             "table_name": table_name,
@@ -440,15 +613,15 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="List registered tables from table_registry. Archived tables are hidden by default.")
     def list_tables(include_archived: bool = False) -> dict[str, Any]:
         return {"tables": schema_manager.list_tables(include_archived=include_archived)}
 
-    @mcp.tool()
+    @mcp.tool(description="Describe a table's columns/types using gateway-safe introspection.")
     def describe_table(table_name: str) -> dict[str, Any]:
         return schema_manager.describe_table(table_name)
 
-    @mcp.tool()
+    @mcp.tool(description="Archive a table in registry metadata. Physical DROP TABLE is not supported.")
     def archive_table(table_name: str) -> dict[str, Any]:
         payload = {"table_name": table_name}
 
@@ -464,7 +637,7 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="Insert rows into a registered table. Gateway will auto-populate standard metadata columns.")
     def insert_rows(table_name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         payload = {"table_name": table_name, "rows": rows}
 
@@ -480,7 +653,7 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="Update rows by constrained filters. Full-table updates are blocked without filters.")
     def update_rows(table_name: str, values: dict[str, Any], filters: list[RowFilter]) -> dict[str, Any]:
         payload = {
             "table_name": table_name,
@@ -504,7 +677,7 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="Archive rows (soft delete) by setting archived=true using constrained filters.")
     def archive_rows(table_name: str, filters: list[RowFilter]) -> dict[str, Any]:
         payload = {"table_name": table_name, "filters": [f.model_dump() for f in filters]}
 
@@ -520,7 +693,12 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Query rows from a registered table using constrained filters/sort/limit. By default archived rows are "
+            "excluded by policy."
+        )
+    )
     def query_rows(
         table_name: str,
         filters: list[RowFilter] | None = None,
@@ -534,7 +712,7 @@ def create_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="Get cross-entity timeline (sessions, meetings, decisions) for a project.")
     def get_project_timeline(
         employer_name: str,
         project_name: str,
@@ -550,19 +728,24 @@ def create_mcp_server(
             limit=limit,
         )
 
-    @mcp.tool()
+    @mcp.tool(description="Get project-level summary counts for sessions, meetings, decisions, and open dependencies.")
     def get_project_summary(employer_name: str, project_name: str) -> dict[str, Any]:
         return reporting_service.get_project_summary(employer_name=employer_name, project_name=project_name)
 
-    @mcp.tool()
+    @mcp.tool(description="List open dependencies for an employer, optionally constrained to a project.")
     def get_open_dependencies(employer_name: str, project_name: str | None = None) -> dict[str, Any]:
         return reporting_service.get_open_dependencies(employer_name=employer_name, project_name=project_name)
 
-    @mcp.tool()
+    @mcp.tool(description="Read an Obsidian note by relative path within VAULT_ROOT.")
     def get_obsidian_note(path: str) -> dict[str, Any]:
         return obsidian_store.get_note(path)
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Advanced/manual note write. Prefer structured logging tools (log_coding_session/log_meeting/log_decision) "
+            "for canonical formatting and paths."
+        )
+    )
     def upsert_obsidian_note(path: str, content: str, mode: Literal["overwrite", "append"] = "overwrite") -> dict[str, Any]:
         payload = {"path": path, "mode": mode, "content_len": len(content)}
 
@@ -578,7 +761,103 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool()
+    @mcp.tool(
+        description=(
+            "Fetch the canonical shared logging skill used for second-brain memory behavior. Returns active "
+            "content from Obsidian if present, otherwise server default content."
+        )
+    )
+    def get_logging_skill() -> dict[str, Any]:
+        note = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
+        if note["exists"]:
+            return _skill_snapshot(note["content"], source="vault")
+        return _skill_snapshot(DEFAULT_LOGGING_SKILL_CONTENT, source="default")
+
+    @mcp.tool(
+        description=(
+            "Initialize the shared logging skill in Obsidian at a canonical path so all agents/devices can "
+            "read the same skill. Set force=true to overwrite existing content with server default."
+        )
+    )
+    def initialize_logging_skill(force: bool = False) -> dict[str, Any]:
+        payload = {"path": LOGGING_SKILL_CANONICAL_PATH, "force": force}
+
+        def _exec() -> tuple[dict[str, Any], int, str, str]:
+            existing = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
+            if existing["exists"] and not force:
+                data = {
+                    "initialized": False,
+                    "path": LOGGING_SKILL_CANONICAL_PATH,
+                    "reason": "already_exists",
+                    **_skill_snapshot(existing["content"], source="vault"),
+                }
+                return data, 0, LOGGING_SKILL_CANONICAL_PATH, LOGGING_SKILL_CANONICAL_PATH
+
+            note_path = obsidian_store.upsert_note(
+                LOGGING_SKILL_CANONICAL_PATH,
+                DEFAULT_LOGGING_SKILL_CONTENT,
+                mode="overwrite",
+            )
+            data = {
+                "initialized": True,
+                "path": note_path,
+                "reason": "forced_overwrite" if force and existing["exists"] else "created",
+                **_skill_snapshot(DEFAULT_LOGGING_SKILL_CONTENT, source="default"),
+            }
+            return data, 1, note_path, note_path
+
+        return execute_mutation(
+            action_type="initialize_logging_skill",
+            target_system="obsidian",
+            table_name=None,
+            payload=payload,
+            executor=_exec,
+        )
+
+    @mcp.tool(
+        description=(
+            "Update the shared logging skill at the canonical Obsidian path. Use this to evolve second-brain "
+            "logging behavior once for all connected agents."
+        )
+    )
+    def update_logging_skill(
+        content: str,
+        mode: Literal["overwrite", "append"] = "overwrite",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_reason = _clean_optional_text(reason, "reason", max_len=500)
+        normalized_content = _clean_skill_content(content)
+        payload = {
+            "path": LOGGING_SKILL_CANONICAL_PATH,
+            "mode": mode,
+            "reason": normalized_reason,
+            "content_len": len(normalized_content),
+        }
+
+        def _exec() -> tuple[dict[str, Any], int, str, str]:
+            note_path = obsidian_store.upsert_note(
+                LOGGING_SKILL_CANONICAL_PATH,
+                normalized_content,
+                mode=mode,
+            )
+            current = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
+            data = {
+                "path": note_path,
+                "mode": mode,
+                "reason": normalized_reason,
+                **_skill_snapshot(current["content"], source="vault"),
+            }
+            return data, 1, note_path, note_path
+
+        return execute_mutation(
+            action_type="update_logging_skill",
+            target_system="obsidian",
+            table_name=None,
+            payload=payload,
+            executor=_exec,
+        )
+
+    @mcp.tool(description="Get non-destructive safety policy enforced by the gateway.")
     def get_gateway_policy() -> dict[str, Any]:
         return {
             "destructive_operations": "disabled",
@@ -586,6 +865,65 @@ def create_mcp_server(
             "table_deletion_policy": "archive_only",
             "drop_table_supported": False,
             "delete_rows_supported": False,
+        }
+
+    @mcp.tool(
+        description=(
+            "Get canonical agent usage rules for this gateway: intent-to-tool mapping, required fields, idempotency "
+            "format, and when to avoid free-form note writes."
+        )
+    )
+    def get_usage_playbook() -> dict[str, Any]:
+        return {
+            "version": "2026-04-16",
+            "intent_to_tool": {
+                "log this session": "log_coding_session",
+                "log meeting": "log_meeting",
+                "log decision": "log_decision",
+                "read note": "get_obsidian_note",
+                "custom note write": "upsert_obsidian_note",
+                "get logging skill": "get_logging_skill",
+                "initialize logging skill": "initialize_logging_skill",
+                "update logging skill": "update_logging_skill",
+            },
+            "session_logging_standard": {
+                "required_fields": [
+                    "employer_name",
+                    "project_name",
+                    "session_title",
+                    "idempotency_key",
+                    "started_at",
+                ],
+                "idempotency_key_regex": "^[A-Za-z0-9._:-]{6,128}$",
+                "recommended_idempotency_key": "<agent>-<machine>-<utcstamp>-<seq>",
+                "notes": [
+                    "Use log_coding_session for normal session updates.",
+                    "Reuse the same idempotency_key for retries/replays.",
+                    "Use ISO-8601 timestamps (timezone-aware preferred).",
+                ],
+            },
+            "write_policy": {
+                "prefer_structured_tools": True,
+                "upsert_obsidian_note": "manual_or_exception_only",
+                "non_destructive": True,
+                "row_delete_mode": "archive_only",
+                "table_delete_mode": "archive_only",
+            },
+            "shared_skill": {
+                "name": LOGGING_SKILL_NAME,
+                "version": LOGGING_SKILL_VERSION,
+                "canonical_path": LOGGING_SKILL_CANONICAL_PATH,
+                "management_tools": [
+                    "get_logging_skill",
+                    "initialize_logging_skill",
+                    "update_logging_skill",
+                ],
+                "notes": [
+                    "Initialize once per vault with initialize_logging_skill.",
+                    "Use update_logging_skill to evolve behavior centrally for all agents.",
+                    "Prefer structured logging tools over free-form notes.",
+                ],
+            },
         }
 
     return mcp
