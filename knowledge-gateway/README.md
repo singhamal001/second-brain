@@ -37,9 +37,16 @@ Unified VPS-hosted MCP gateway for Obsidian vault + Supabase/Postgres.
 ## Agent Guidance
 - Logging standard: `docs/logging-standard.md`
 - Reusable logging skill spec: `skills/knowledge-gateway-logging/SKILL.md`
-- Shared-skill MCP tools:
+- Skill-suite MCP tools:
+  - `list_gateway_skills`
+  - `get_gateway_skill`
+  - `initialize_gateway_skill`
+  - `initialize_gateway_skills`
+  - `update_gateway_skill`
+- Backward-compatible logging wrappers:
   - `get_logging_skill`
   - `initialize_logging_skill`
   - `update_logging_skill`
+- Skill suite architecture: `docs/architecture/skill-suite-router-protocol.md`
 - Codex multi-machine setup: `docs/setup/codex-instances-setup.md`
 - GHCR release/deploy runbook: `docs/deploy/ghcr-rebuild-push-pull.md`

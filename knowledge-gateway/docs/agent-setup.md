@@ -170,6 +170,16 @@ Put this in each agent's system/custom instructions:
 3. Use `upsert_obsidian_note` only when explicit custom note behavior is requested.
 4. Always include `idempotency_key` for session logging.
 
+## Skill Pull + Cache Policy (All Agents)
+1. At session start, call `get_usage_playbook` once and cache by `version`.
+2. Call `list_gateway_skills` and fetch only required skills via `get_gateway_skill`.
+3. Do not fetch all skills for every prompt; load only skill docs required by current intent.
+4. Respect router defaults from playbook:
+   - `scope_resolution_policy = ask_if_missing`
+   - `unknown_intent_policy = clarify_then_proceed`
+   - DB-intent `create database -> create_dynamic_table`
+5. For shared updates, use `update_gateway_skill` (or logging wrappers for legacy flow).
+
 ## References
 - OpenAI Codex MCP docs: https://developers.openai.com/codex/mcp
 - OpenAI Docs MCP quickstart (Codex/Cursor examples): https://developers.openai.com/learn/docs-mcp

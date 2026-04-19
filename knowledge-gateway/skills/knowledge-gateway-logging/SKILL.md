@@ -1,5 +1,8 @@
 # Skill: knowledge-gateway-logging
 
+## Version
+2026-04-19
+
 ## Purpose
 Turn raw development activity into durable second-brain memory with consistent structure across projects, devices, and agents.
 
@@ -32,18 +35,12 @@ Highly recommended fields:
 ## Idempotency Standard
 - Reuse the same `idempotency_key` for retries/replays of one logical write.
 - Recommended format: `<agent>-<machine>-<utcstamp>-<seq>`
-- Example: `codex-lenovo-20260416T143000Z-001`
+- Example: `codex-lenovo-20260419T160000Z-001`
 
-## Quality Bar
-1. Write factual summaries, not vague status lines.
-2. Record concrete next steps and owners where possible.
-3. Keep terminology stable (`aws-lambda`, `cloudflare-access`, `mcp-auth`) for better retrieval.
-4. Prefer short reusable tags in lowercase.
-
-## Safety Model
-1. Do not use destructive data flows.
-2. Use archive semantics (`archive_rows`, `archive_table`) for removal intent.
-3. Do not bypass gateway constraints with raw SQL behavior.
+## Checksum Discipline
+- Treat this document as versioned policy.
+- Before replacing content, compare checksum via `get_gateway_skill`.
+- Include update reason when using `update_gateway_skill`.
 
 ## Verification Checklist
 After every structured write:
@@ -51,10 +48,3 @@ After every structured write:
 2. Save `operation_id`
 3. Capture `obsidian_note_path` when relevant
 4. If retrying, reuse the same `idempotency_key`
-
-## Retrieval Habits
-For "what did we do before?":
-1. `get_project_timeline` for chronology
-2. `get_project_summary` for aggregate context
-3. `get_open_dependencies` for blockers
-4. `get_obsidian_note` when exact note path is known

@@ -87,17 +87,21 @@ Expected:
 - `HTTP 200`
 - `mcp-session-id` header present
 
-## 5) Initialize Shared Logging Skill Once
+## 5) Initialize Shared Skill Suite Once
 From any agent connected to MCP:
-1. Call `initialize_logging_skill`.
-2. Call `get_logging_skill` to verify content/path.
+1. Call `initialize_gateway_skills`.
+2. Call `list_gateway_skills`.
+3. Call `get_gateway_skill` only for skills needed by current intent.
 
-Canonical skill path in vault:
+Canonical skill paths in vault:
+- `System/Skills/knowledge-gateway-router/SKILL.md`
 - `System/Skills/knowledge-gateway-logging/SKILL.md`
+- `System/Skills/knowledge-gateway-schema-intake/SKILL.md`
 
 ## 6) Recommended Agent Behavior
-1. Use `create_employer` and `create_project` for context.
-2. Use `log_coding_session`/`log_meeting`/`log_decision` for canonical writes.
-3. Use `upsert_obsidian_note` only for explicit manual/custom notes.
-4. Use `idempotency_key` for reliable retries.
-
+1. Call `get_usage_playbook` once per session and cache by `version`.
+2. Use `create_employer` and `create_project` for context.
+3. Use `log_coding_session`/`log_meeting`/`log_decision` for canonical writes.
+4. Use `upsert_obsidian_note` only for explicit manual/custom notes.
+5. For "create database" style prompts, route to `create_dynamic_table` with scope clarifications first.
+6. Use `idempotency_key` for reliable retries.

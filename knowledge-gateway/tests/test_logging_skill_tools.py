@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 
 def _result(payload):
     if isinstance(payload, tuple):
@@ -9,67 +11,109 @@ def _result(payload):
     return payload
 
 
-def test_get_logging_skill_defaults_when_not_initialized(app):
-    payload = asyncio.run(app.state.mcp.call_tool("get_logging_skill", {}))
+def test_list_gateway_skills_returns_split_skill_suite(app):
+    payload = asyncio.run(app.state.mcp.call_tool("list_gateway_skills", {}))
     data = _result(payload)
 
-    assert data["skill_name"] == "knowledge-gateway-logging"
-    assert data["version"] == "2026-04-16"
-    assert data["source"] == "default"
-    assert data["path"] == "System/Skills/knowledge-gateway-logging/SKILL.md"
-    assert "Golden Rule" in data["content"]
+    names = {s["skill_name"] for s in data["skills"]}
+    assert "knowledge-gateway-logging" in names
+    assert "knowledge-gateway-router" in names
+    assert "knowledge-gateway-schema-intake" in names
+    assert data["count"] == 3
 
 
-def test_initialize_logging_skill_creates_canonical_note(app):
-    payload = asyncio.run(app.state.mcp.call_tool("initialize_logging_skill", {}))
+def test_get_gateway_skill_rejects_unknown_name(app):
+    with pytest.raises(Exception):
+        asyncio.run(app.state.mcp.call_tool("get_gateway_skill", {"skill_name": "unknown-skill"}))
+
+
+def test_initialize_gateway_skills_creates_all_canonical_paths(app):
+    payload = asyncio.run(app.state.mcp.call_tool("initialize_gateway_skills", {}))
     data = _result(payload)
 
     assert data["status"] == "success"
-    assert data["data"]["initialized"] is True
+    assert data["data"]["initialized_count"] == 3
 
-    note_path = app.state.settings.vault_root / "System" / "Skills" / "knowledge-gateway-logging" / "SKILL.md"
-    assert note_path.exists()
-    assert "Skill: knowledge-gateway-logging" in note_path.read_text(encoding="utf-8")
-
-    current = _result(asyncio.run(app.state.mcp.call_tool("get_logging_skill", {})))
-    assert current["source"] == "vault"
+    vault = app.state.settings.vault_root
+    assert (vault / "System" / "Skills" / "knowledge-gateway-logging" / "SKILL.md").exists()
+    assert (vault / "System" / "Skills" / "knowledge-gateway-router" / "SKILL.md").exists()
+    assert (vault / "System" / "Skills" / "knowledge-gateway-schema-intake" / "SKILL.md").exists()
 
 
-def test_update_logging_skill_overwrite_and_append(app):
-    asyncio.run(app.state.mcp.call_tool("initialize_logging_skill", {}))
+def test_update_gateway_skill_writes_and_get_reads_back(app):
+    asyncio.run(
+        app.state.mcp.call_tool(
+            "initialize_gateway_skill",
+            {"skill_name": "knowledge-gateway-router", "force": True},
+        )
+    )
 
-    overwrite = _result(
+    updated = _result(
         asyncio.run(
             app.state.mcp.call_tool(
-                "update_logging_skill",
+                "update_gateway_skill",
                 {
-                    "content": "# Skill: knowledge-gateway-logging\n\n## Purpose\nCustom behavior.",
+                    "skill_name": "knowledge-gateway-router",
+                    "content": "# Skill: knowledge-gateway-router\n\n## Purpose\nCustom router behavior.",
                     "mode": "overwrite",
-                    "reason": "customize for device-agnostic policy",
+                    "reason": "test update",
                 },
             )
         )
     )
-    assert overwrite["status"] == "success"
+    assert updated["status"] == "success"
 
-    after_overwrite = _result(asyncio.run(app.state.mcp.call_tool("get_logging_skill", {})))
-    assert "Custom behavior." in after_overwrite["content"]
-    assert after_overwrite["source"] == "vault"
-
-    append = _result(
+    current = _result(
         asyncio.run(
             app.state.mcp.call_tool(
-                "update_logging_skill",
-                {
-                    "content": "## Retrieval Reminder\nAlways use project timeline first.",
-                    "mode": "append",
-                },
+                "get_gateway_skill",
+                {"skill_name": "knowledge-gateway-router"},
             )
         )
     )
-    assert append["status"] == "success"
+    assert current["source"] == "vault"
+    assert "Custom router behavior." in current["content"]
 
-    after_append = _result(asyncio.run(app.state.mcp.call_tool("get_logging_skill", {})))
-    assert "Custom behavior." in after_append["content"]
-    assert "Always use project timeline first." in after_append["content"]
+
+def test_logging_wrappers_match_generic_behavior(app):
+    generic = _result(
+        asyncio.run(
+            app.state.mcp.call_tool(
+                "get_gateway_skill",
+                {"skill_name": "knowledge-gateway-logging"},
+            )
+        )
+    )
+    wrapper = _result(asyncio.run(app.state.mcp.call_tool("get_logging_skill", {})))
+    assert wrapper["skill_name"] == generic["skill_name"]
+    assert wrapper["version"] == generic["version"]
+    assert wrapper["path"] == generic["path"]
+
+    init_wrapper = _result(asyncio.run(app.state.mcp.call_tool("initialize_logging_skill", {"force": True})))
+    init_generic = _result(
+        asyncio.run(
+            app.state.mcp.call_tool(
+                "initialize_gateway_skill",
+                {"skill_name": "knowledge-gateway-logging", "force": True},
+            )
+        )
+    )
+    assert init_wrapper["status"] == "success"
+    assert init_generic["status"] == "success"
+    assert init_wrapper["data"]["path"] == init_generic["data"]["path"]
+
+
+def test_router_playbook_contracts_for_db_intent_and_naming(app):
+    data = _result(asyncio.run(app.state.mcp.call_tool("get_usage_playbook", {})))
+
+    create_db_route = data["db_intent_mapping"]["create database"]["route_to"]
+    assert create_db_route == "create_dynamic_table"
+
+    assert data["intent_router_protocol"]["unknown_intent_policy"] == "clarify_then_proceed"
+    assert data["intent_router_protocol"]["write_on_ambiguous_intent"] is False
+
+    naming = data["table_naming_policy"]
+    assert naming["global_template"] == "global_<name>"
+    assert naming["employer_template"] == "<employer_slug>_<name>"
+    assert naming["project_template"] == "<employer_slug>_<project_slug>_<name>"
 

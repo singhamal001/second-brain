@@ -17,10 +17,11 @@ from .services.obsidian_store import ObsidianStore
 from .services.reporting import ReportingService
 from .services.schema_manager import SchemaManager
 from .skills_catalog import (
-    DEFAULT_LOGGING_SKILL_CONTENT,
-    LOGGING_SKILL_CANONICAL_PATH,
     LOGGING_SKILL_NAME,
-    LOGGING_SKILL_VERSION,
+    ROUTER_SKILL_NAME,
+    SCHEMA_INTAKE_SKILL_NAME,
+    get_skill_spec,
+    list_skill_specs,
 )
 
 
@@ -142,11 +143,14 @@ def _clean_skill_content(value: str, *, max_len: int = 200_000) -> str:
     return cleaned + "\n"
 
 
-def _skill_snapshot(content: str, source: str) -> dict[str, Any]:
+def _skill_snapshot(skill_name: str, content: str, source: str) -> dict[str, Any]:
+    spec = get_skill_spec(skill_name)
+    if spec is None:
+        raise ValidationError(f"unknown skill_name: {skill_name}")
     return {
-        "skill_name": LOGGING_SKILL_NAME,
-        "version": LOGGING_SKILL_VERSION,
-        "path": LOGGING_SKILL_CANONICAL_PATH,
+        "skill_name": spec.name,
+        "version": spec.version,
+        "path": spec.canonical_path,
         "source": source,
         "checksum_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "content": content,
@@ -761,53 +765,98 @@ def create_mcp_server(
             executor=_exec,
         )
 
-    @mcp.tool(
-        description=(
-            "Fetch the canonical shared logging skill used for second-brain memory behavior. Returns active "
-            "content from Obsidian if present, otherwise server default content."
-        )
-    )
-    def get_logging_skill() -> dict[str, Any]:
-        note = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
-        if note["exists"]:
-            return _skill_snapshot(note["content"], source="vault")
-        return _skill_snapshot(DEFAULT_LOGGING_SKILL_CONTENT, source="default")
+    def _resolve_skill(skill_name: str):
+        normalized = _clean_required_text(skill_name, "skill_name", max_len=120).strip().lower()
+        spec = get_skill_spec(normalized)
+        if spec is None:
+            raise ValidationError(f"unknown skill_name: {normalized}")
+        return spec
 
-    @mcp.tool(
-        description=(
-            "Initialize the shared logging skill in Obsidian at a canonical path so all agents/devices can "
-            "read the same skill. Set force=true to overwrite existing content with server default."
-        )
-    )
-    def initialize_logging_skill(force: bool = False) -> dict[str, Any]:
-        payload = {"path": LOGGING_SKILL_CANONICAL_PATH, "force": force}
+    def _active_skill_snapshot(skill_name: str) -> dict[str, Any]:
+        spec = _resolve_skill(skill_name)
+        note = obsidian_store.get_note(spec.canonical_path)
+        if note["exists"]:
+            return _skill_snapshot(spec.name, note["content"], source="vault")
+        return _skill_snapshot(spec.name, spec.default_content, source="default")
+
+    def _initialize_skill(
+        *,
+        skill_name: str,
+        force: bool,
+    ) -> tuple[dict[str, Any], int, str]:
+        spec = _resolve_skill(skill_name)
+        existing = obsidian_store.get_note(spec.canonical_path)
+        if existing["exists"] and not force:
+            data = {
+                "initialized": False,
+                "path": spec.canonical_path,
+                "reason": "already_exists",
+                **_skill_snapshot(spec.name, existing["content"], source="vault"),
+            }
+            return data, 0, spec.canonical_path
+
+        path = obsidian_store.upsert_note(spec.canonical_path, spec.default_content, mode="overwrite")
+        current = obsidian_store.get_note(spec.canonical_path)
+        data = {
+            "initialized": True,
+            "path": path,
+            "reason": "forced_overwrite" if force and existing["exists"] else "created",
+            **_skill_snapshot(spec.name, current["content"], source="vault"),
+        }
+        return data, 1, path
+
+    def _initialize_skill_mutation(
+        *,
+        skill_name: str,
+        force: bool,
+        action_type: str,
+    ) -> dict[str, Any]:
+        payload = {"skill_name": skill_name, "force": force}
 
         def _exec() -> tuple[dict[str, Any], int, str, str]:
-            existing = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
-            if existing["exists"] and not force:
-                data = {
-                    "initialized": False,
-                    "path": LOGGING_SKILL_CANONICAL_PATH,
-                    "reason": "already_exists",
-                    **_skill_snapshot(existing["content"], source="vault"),
-                }
-                return data, 0, LOGGING_SKILL_CANONICAL_PATH, LOGGING_SKILL_CANONICAL_PATH
-
-            note_path = obsidian_store.upsert_note(
-                LOGGING_SKILL_CANONICAL_PATH,
-                DEFAULT_LOGGING_SKILL_CONTENT,
-                mode="overwrite",
-            )
-            data = {
-                "initialized": True,
-                "path": note_path,
-                "reason": "forced_overwrite" if force and existing["exists"] else "created",
-                **_skill_snapshot(DEFAULT_LOGGING_SKILL_CONTENT, source="default"),
-            }
-            return data, 1, note_path, note_path
+            data, affected, path = _initialize_skill(skill_name=skill_name, force=force)
+            return data, affected, path, skill_name
 
         return execute_mutation(
-            action_type="initialize_logging_skill",
+            action_type=action_type,
+            target_system="obsidian",
+            table_name=None,
+            payload=payload,
+            executor=_exec,
+        )
+
+    def _update_skill_mutation(
+        *,
+        skill_name: str,
+        content: str,
+        mode: Literal["overwrite", "append"],
+        reason: str | None,
+        action_type: str,
+    ) -> dict[str, Any]:
+        spec = _resolve_skill(skill_name)
+        normalized_reason = _clean_optional_text(reason, "reason", max_len=500)
+        normalized_content = _clean_skill_content(content)
+        payload = {
+            "skill_name": spec.name,
+            "path": spec.canonical_path,
+            "mode": mode,
+            "reason": normalized_reason,
+            "content_len": len(normalized_content),
+        }
+
+        def _exec() -> tuple[dict[str, Any], int, str, str]:
+            path = obsidian_store.upsert_note(spec.canonical_path, normalized_content, mode=mode)
+            current = obsidian_store.get_note(spec.canonical_path)
+            data = {
+                "path": path,
+                "mode": mode,
+                "reason": normalized_reason,
+                **_skill_snapshot(spec.name, current["content"], source="vault"),
+            }
+            return data, 1, path, spec.name
+
+        return execute_mutation(
+            action_type=action_type,
             target_system="obsidian",
             table_name=None,
             payload=payload,
@@ -816,8 +865,126 @@ def create_mcp_server(
 
     @mcp.tool(
         description=(
-            "Update the shared logging skill at the canonical Obsidian path. Use this to evolve second-brain "
-            "logging behavior once for all connected agents."
+            "List canonical gateway skill definitions managed by the MCP server. Use this to discover "
+            "available skill names, versions, and canonical Obsidian paths."
+        )
+    )
+    def list_gateway_skills() -> dict[str, Any]:
+        skills: list[dict[str, Any]] = []
+        for spec in list_skill_specs():
+            active = _active_skill_snapshot(spec.name)
+            skills.append(
+                {
+                    "skill_name": spec.name,
+                    "version": spec.version,
+                    "path": spec.canonical_path,
+                    "active_source": active["source"],
+                    "active_checksum_sha256": active["checksum_sha256"],
+                }
+            )
+        return {"skills": skills, "count": len(skills)}
+
+    @mcp.tool(
+        description=(
+            "Fetch one canonical gateway skill by name. Returns active content from Obsidian if present, "
+            "otherwise returns the server default content."
+        )
+    )
+    def get_gateway_skill(skill_name: str) -> dict[str, Any]:
+        return _active_skill_snapshot(skill_name)
+
+    @mcp.tool(
+        description=(
+            "Initialize a gateway skill in Obsidian at its canonical path. Set force=true to overwrite existing "
+            "vault content with server default content."
+        )
+    )
+    def initialize_gateway_skill(skill_name: str, force: bool = False) -> dict[str, Any]:
+        return _initialize_skill_mutation(
+            skill_name=skill_name,
+            force=force,
+            action_type="initialize_gateway_skill",
+        )
+
+    @mcp.tool(
+        description=(
+            "Initialize all gateway skills in canonical Obsidian paths. Set force=true to overwrite existing "
+            "vault content with server defaults."
+        )
+    )
+    def initialize_gateway_skills(force: bool = False) -> dict[str, Any]:
+        payload = {"force": force, "skill_names": [spec.name for spec in list_skill_specs()]}
+
+        def _exec() -> tuple[dict[str, Any], int, None, str]:
+            results: list[dict[str, Any]] = []
+            affected_total = 0
+            for spec in list_skill_specs():
+                data, affected, _ = _initialize_skill(skill_name=spec.name, force=force)
+                results.append(data)
+                affected_total += affected
+            return (
+                {
+                    "force": force,
+                    "initialized_count": affected_total,
+                    "skipped_count": len(results) - affected_total,
+                    "skills": results,
+                },
+                affected_total,
+                None,
+                "all_gateway_skills",
+            )
+
+        return execute_mutation(
+            action_type="initialize_gateway_skills",
+            target_system="obsidian",
+            table_name=None,
+            payload=payload,
+            executor=_exec,
+        )
+
+    @mcp.tool(
+        description=(
+            "Update one gateway skill at its canonical Obsidian path. Use this to evolve centralized, "
+            "cross-device behavior for all connected coding agents."
+        )
+    )
+    def update_gateway_skill(
+        skill_name: str,
+        content: str,
+        mode: Literal["overwrite", "append"] = "overwrite",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return _update_skill_mutation(
+            skill_name=skill_name,
+            content=content,
+            mode=mode,
+            reason=reason,
+            action_type="update_gateway_skill",
+        )
+
+    @mcp.tool(
+        description=(
+            "Backward-compatible wrapper for get_gateway_skill('knowledge-gateway-logging')."
+        )
+    )
+    def get_logging_skill() -> dict[str, Any]:
+        return get_gateway_skill(LOGGING_SKILL_NAME)
+
+    @mcp.tool(
+        description=(
+            "Backward-compatible wrapper for initialize_gateway_skill on the logging skill."
+        )
+    )
+    def initialize_logging_skill(force: bool = False) -> dict[str, Any]:
+        return _initialize_skill_mutation(
+            skill_name=LOGGING_SKILL_NAME,
+            force=force,
+            action_type="initialize_logging_skill",
+        )
+
+    @mcp.tool(
+        description=(
+            "Backward-compatible wrapper for update_gateway_skill on the logging skill."
         )
     )
     def update_logging_skill(
@@ -825,36 +992,12 @@ def create_mcp_server(
         mode: Literal["overwrite", "append"] = "overwrite",
         reason: str | None = None,
     ) -> dict[str, Any]:
-        normalized_reason = _clean_optional_text(reason, "reason", max_len=500)
-        normalized_content = _clean_skill_content(content)
-        payload = {
-            "path": LOGGING_SKILL_CANONICAL_PATH,
-            "mode": mode,
-            "reason": normalized_reason,
-            "content_len": len(normalized_content),
-        }
-
-        def _exec() -> tuple[dict[str, Any], int, str, str]:
-            note_path = obsidian_store.upsert_note(
-                LOGGING_SKILL_CANONICAL_PATH,
-                normalized_content,
-                mode=mode,
-            )
-            current = obsidian_store.get_note(LOGGING_SKILL_CANONICAL_PATH)
-            data = {
-                "path": note_path,
-                "mode": mode,
-                "reason": normalized_reason,
-                **_skill_snapshot(current["content"], source="vault"),
-            }
-            return data, 1, note_path, note_path
-
-        return execute_mutation(
+        return _update_skill_mutation(
+            skill_name=LOGGING_SKILL_NAME,
+            content=content,
+            mode=mode,
+            reason=reason,
             action_type="update_logging_skill",
-            target_system="obsidian",
-            table_name=None,
-            payload=payload,
-            executor=_exec,
         )
 
     @mcp.tool(description="Get non-destructive safety policy enforced by the gateway.")
@@ -875,16 +1018,51 @@ def create_mcp_server(
     )
     def get_usage_playbook() -> dict[str, Any]:
         return {
-            "version": "2026-04-16",
+            "version": "2026-04-19",
             "intent_to_tool": {
                 "log this session": "log_coding_session",
                 "log meeting": "log_meeting",
                 "log decision": "log_decision",
                 "read note": "get_obsidian_note",
                 "custom note write": "upsert_obsidian_note",
+                "list skills": "list_gateway_skills",
+                "get skill": "get_gateway_skill",
+                "initialize skill": "initialize_gateway_skill",
+                "initialize skills": "initialize_gateway_skills",
+                "update skill": "update_gateway_skill",
                 "get logging skill": "get_logging_skill",
                 "initialize logging skill": "initialize_logging_skill",
                 "update logging skill": "update_logging_skill",
+            },
+            "intent_router_protocol": {
+                "session_bootstrap": "call get_usage_playbook once per session and cache by version",
+                "scope_resolution_model": [
+                    "global",
+                    "employer_all_projects",
+                    "single_project",
+                    "multi_employer_or_multi_project",
+                ],
+                "scope_resolution_policy": "ask_if_missing",
+                "clarification_batch_policy": "ask_one_consolidated_question",
+                "unknown_intent_policy": "clarify_then_proceed",
+                "write_on_ambiguous_intent": False,
+                "tool_discovery_policy": "avoid_redundant_discovery_when_playbook_cached",
+            },
+            "db_intent_mapping": {
+                "create database": {
+                    "route_to": "create_dynamic_table",
+                    "required_clarifications_if_missing": [
+                        "scope",
+                        "table_purpose",
+                        "columns_with_types",
+                    ],
+                }
+            },
+            "table_naming_policy": {
+                "mode": "auto_prefix_by_scope",
+                "global_template": "global_<name>",
+                "employer_template": "<employer_slug>_<name>",
+                "project_template": "<employer_slug>_<project_slug>_<name>",
             },
             "session_logging_standard": {
                 "required_fields": [
@@ -909,19 +1087,24 @@ def create_mcp_server(
                 "row_delete_mode": "archive_only",
                 "table_delete_mode": "archive_only",
             },
-            "shared_skill": {
-                "name": LOGGING_SKILL_NAME,
-                "version": LOGGING_SKILL_VERSION,
-                "canonical_path": LOGGING_SKILL_CANONICAL_PATH,
+            "skill_suite": {
+                "source_of_truth": "mcp_hosted_vault_skills",
+                "names": [
+                    LOGGING_SKILL_NAME,
+                    ROUTER_SKILL_NAME,
+                    SCHEMA_INTAKE_SKILL_NAME,
+                ],
                 "management_tools": [
+                    "list_gateway_skills",
+                    "get_gateway_skill",
+                    "initialize_gateway_skill",
+                    "initialize_gateway_skills",
+                    "update_gateway_skill",
+                ],
+                "backward_compatible_wrappers": [
                     "get_logging_skill",
                     "initialize_logging_skill",
                     "update_logging_skill",
-                ],
-                "notes": [
-                    "Initialize once per vault with initialize_logging_skill.",
-                    "Use update_logging_skill to evolve behavior centrally for all agents.",
-                    "Prefer structured logging tools over free-form notes.",
                 ],
             },
         }
